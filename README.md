@@ -1,0 +1,1 @@
+During the All-Star break I challenged myself to create a Pitching fWAR model for the remainder of the season. It took account for age, young players without much sample size, games remaining, and primes/declines.
