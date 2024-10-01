@@ -1,0 +1,393 @@
+---
+title: "Predictive Baseball Model Using Plus Minus Stats"
+author: "Jacob Weber"
+date: "2024-07-18"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+library(randomForest)
+library(baseballr)
+```
+
+```{r}
+# Data Scraping
+fg_2021_data <- fg_pitch_leaders( startseason = "2021", endseason = "2021", qual = 0)
+fg_2022_data <- fg_pitch_leaders( startseason = "2022", endseason = "2022", qual = 0)
+fg_2023_data <- fg_pitch_leaders( startseason = "2023", endseason = "2023", qual = 0)
+All_Star_Break_2024 <- fg_pitch_leaders( startseason = "2024", endseason = "2024", qual = 0)
+```
+
+```{r}
+# Function to calculate age factor
+calculate_age_factor <- function(age) {
+  if (age < 27) {
+    return(1 + (27 - age) * 0.01)  # Slight progression for younger players
+  } else if (age >= 27 && age < 29) {
+    return(1 + (29 - age) * 0.02)  # More significant progression
+  } else if (age >= 29 && age < 31) {
+    return(1 + (31 - age) * 0.01)  # Slight progression
+  } else if (age >= 31 && age < 35) {
+    return(1 - (age - 31) * 0.02)  # Moderate regression
+  } else {
+    return(1 - (age - 35) * 0.03)  # More significant regression for older players
+  }
+}
+```
+
+```{r}
+# Function to inverse metrics where lower is better
+inverse_metric <- function(x) {
+  return(1 / (x + 1))  # Adding 1 to avoid division by zero
+}
+```
+
+```{r}
+# List of all dataframes
+all_dfs <- list(fg_2021_data, fg_2022_data, fg_2023_data, All_Star_Break_2024)
+```
+
+```{r}
+# Get common column names across all dataframes
+common_cols <- reduce(map(all_dfs, colnames), intersect)
+```
+
+```{r}
+# Ensure G and GS are included in common_cols
+common_cols <- unique(c(common_cols, "G", "GS"))
+```
+
+```{r}
+# Function to select common columns, add Year, and keep Name and ID columns
+select_common_cols <- function(df, year) {
+  df %>%
+    select(all_of(common_cols), PlayerName, playerid, G, GS) %>%
+    mutate(Year = year,
+           is_starter = ifelse(GS > (G - GS), 1, 0))  # Add is_starter here
+}
+```
+
+```{r}
+# Apply the function to each dataframe and combine all data
+all_data <- bind_rows(
+  select_common_cols(fg_2021_data, 2021),
+  select_common_cols(fg_2022_data, 2022),
+  select_common_cols(fg_2023_data, 2023),
+  select_common_cols(All_Star_Break_2024, 2024)
+)
+```
+
+```{r}
+# Print the column names of the combined data
+print("Columns in combined data:")
+print(colnames(all_data))
+```
+
+```{r}
+# Select features for the model (adjust these based on the available columns)
+features <- c("Age", "IP", "K_pct", "BB_pct", "ERA-", "FIP-", "BABIP", "GB_pct", "FB_pct", "WHIP+")
+target <- "WAR"  # adjust if needed
+```
+
+```{r}
+# Check if all required columns are present
+missing_cols <- setdiff(c(features, target), colnames(all_data))
+if (length(missing_cols) > 0) {
+  stop(paste("Missing columns:", paste(missing_cols, collapse = ", ")))
+}
+```
+
+```{r}
+# Prepare the data
+model_data <- all_data %>%
+  select(PlayerName, playerid, all_of(c(features, target, "Year", "G", "GS", "is_starter"))) %>%
+  mutate(
+    ERA_minus_inv = inverse_metric(`ERA-`),
+    FIP_minus_inv = inverse_metric(`FIP-`),
+    WHIP_plus_inc = inverse_metric(`WHIP+`)
+  ) %>%
+  na.omit()
+```
+
+```{r}
+# Update features list for the model
+model_features <- c("Age", "IP", "K_pct", "BB_pct", "ERA_minus_inv", "FIP_minus_inv", "BABIP", "GB_pct", "FB_pct", "WHIP_plus_inc")
+model_features <- c(model_features, "is_starter")
+```
+
+```{r}
+# Split the data
+train_data <- model_data %>% filter(Year < 2024)
+test_data <- model_data %>% filter(Year == 2024)
+```
+
+```{r}
+# Ensure True/False variable is Numeric 
+test_data <- test_data %>%
+  mutate(is_starter = as.numeric(is_starter))
+```
+
+```{r}
+# Create weights based on the year
+train_data <- train_data %>%
+  mutate(weight = case_when(
+    Year == 2023 ~ 3,
+    Year == 2022 ~ 2,
+    Year == 2021 ~ 1
+  ))
+```
+
+```{r}
+# Ensuring is_starter is included
+train_data <- train_data %>%
+  mutate(GR = G - GS,
+         is_starter = GS > GR)
+
+test_data <- test_data %>%
+  mutate(GR = G - GS,
+         is_starter = as.numeric(GS > GR))
+```
+
+```{r}
+# Prepare data for modeling
+train_data_model <- train_data %>% select(all_of(c(model_features, target, "is_starter")))
+test_data_model <- test_data %>% select(all_of(c(model_features, "is_starter")))
+```
+
+```{r}
+# Calculate the proportion of the season remaining
+games_played <- 97  # Average number of games played so far
+total_games <- 162
+remaining_season_factor <- (total_games - games_played) / total_games
+```
+
+```{r}
+# Train the model with weights
+rf_model <- randomForest(
+  as.formula(paste(target, "~ .")), 
+  data = train_data_model, 
+  weights = train_data$weight,
+  importance = TRUE
+)
+```
+
+```{r}
+# Make predictions for the rest of the season
+full_season_predictions <- predict(rf_model, test_data_model)
+```
+
+```{r}
+# Function to calculate remaining WAR based on role
+calculate_remaining_war <- function(current_war, predicted_full_season_war, ip, age, is_starter) {
+  # Calculate the league-leading pace
+  league_leading_pace <- max(9, max(current_war) / (1 - remaining_season_factor))
+  
+  # Adjustment factor for young, underperforming players
+  youth_improvement_factor <- if(age < 26 && current_war < 1) {
+    runif(1, 1, 1 + (26 - age) * 0.1)  # Up to 50% improvement for very young players
+  } else if(age < 28 && current_war < 1.5) {
+    runif(1, 1, 1 + (28 - age) * 0.05)  # Up to 25% improvement for young players
+  } else {
+    1
+  }
+  
+  # Adjust the full season prediction
+  if (current_war > 3) {
+    # For top performers, ensure we're not projecting significant negative WAR
+    adjusted_full_season = max(predicted_full_season_war, current_war * 1.2)
+    adjusted_full_season = min(adjusted_full_season, league_leading_pace)
+  } else if (current_war > 0) {
+    # For positive but not elite performers, allow for more upside
+    adjusted_full_season = predicted_full_season_war * runif(1, 1, 1.2) * youth_improvement_factor
+  } else {
+    # For negative performers, allow for both improvement and continued struggles
+    adjusted_full_season = predicted_full_season_war * runif(1, 0.8, 1.2) * youth_improvement_factor
+  }
+  
+  remaining_war <- (adjusted_full_season - current_war)
+  
+  # Adjust for starters vs relievers
+  if (is_starter == 1) {
+    remaining_starts <- 12  # Average remaining starts for a starter
+    total_starts <- 32  # Approximate total starts in a full season
+    remaining_war <- remaining_war * (remaining_starts / total_starts) * 1.4
+  } else {
+    # For relievers, use the remaining season factor
+    remaining_war <- remaining_war * remaining_season_factor * 1.2
+  }
+  
+  # Apply the 3.7 WAR cap
+  remaining_war <- min(remaining_war, 3.7)
+  
+  # Allow for variation in performance
+  variation_factor <- runif(1, 0.8, 1.2)
+  remaining_war <- remaining_war * variation_factor
+  
+  return(remaining_war)
+}
+```
+
+```{r}
+# Calculate remaining WAR
+test_data$Predicted_Remaining_WAR <- mapply(calculate_remaining_war, 
+                                            test_data$WAR, 
+                                            full_season_predictions, 
+                                            test_data$IP,
+                                            test_data$Age,
+                                            test_data$is_starter)
+```
+
+```{r}
+# Calculate full season WAR
+test_data$Predicted_Full_Season_WAR <- test_data$WAR + test_data$Predicted_Remaining_WAR
+```
+
+```{r}
+# Evaluate the model
+mse <- mean((test_data$Predicted_Remaining_WAR - (test_data[[target]] - test_data$WAR) * remaining_season_factor)^2)
+```
+
+```{r}
+# Manual R-squared calculation
+actual <- test_data$WAR
+predicted <- test_data$Predicted_Full_Season_WAR
+SSR <- sum((predicted - actual)^2)
+SST <- sum((actual - mean(actual))^2)
+r_squared <- 1 - SSR/SST
+
+print(paste("MSE:", mse))
+print(paste("R-squared:", r_squared))
+```
+
+```{r}
+# Feature importance
+importance <- importance(rf_model)
+print(importance)
+```
+
+```{r}
+# Print top 20 pitchers by predicted full season WAR
+print(test_data %>% 
+        select(PlayerName, playerid, Age, WAR, Predicted_Remaining_WAR, Predicted_Full_Season_WAR) %>% 
+        mutate(
+          WAR_Improvement = Predicted_Full_Season_WAR - WAR,
+          Improvement_Percentage = ifelse(WAR != 0, (Predicted_Full_Season_WAR - WAR) / abs(WAR) * 100, Inf)
+        ) %>%
+        arrange(desc(Predicted_Full_Season_WAR)) %>%
+        head(20))
+```
+
+```{r}
+# Print bottom 20 pitchers by predicted full season WAR
+print(test_data %>% 
+        select(PlayerName, playerid, Age, WAR, Predicted_Remaining_WAR, Predicted_Full_Season_WAR) %>% 
+        mutate(
+          WAR_Improvement = Predicted_Full_Season_WAR - WAR,
+          Improvement_Percentage = ifelse(WAR != 0, (Predicted_Full_Season_WAR - WAR) / abs(WAR) * 100, Inf)
+        ) %>%
+        arrange(Predicted_Full_Season_WAR) %>%
+        head(20))
+```
+
+```{r}
+# Print summary statistics
+print(paste("Max current WAR:", max(test_data$WAR)))
+print(paste("Min current WAR:", min(test_data$WAR)))
+print(paste("Max predicted remaining WAR:", max(test_data$Predicted_Remaining_WAR)))
+print(paste("Min predicted remaining WAR:", min(test_data$Predicted_Remaining_WAR)))
+print(paste("Max predicted full season WAR:", max(test_data$Predicted_Full_Season_WAR)))
+print(paste("Min predicted full season WAR:", min(test_data$Predicted_Full_Season_WAR)))
+print(paste("Number of players projected for negative WAR:", sum(test_data$Predicted_Full_Season_WAR < 0)))
+print(paste("Average predicted remaining WAR:", mean(test_data$Predicted_Remaining_WAR)))
+```
+
+```{r}
+# Now let's predict for the rest of the 2024 season with age-based adjustments
+rest_of_season_2024 <- test_data %>%
+  mutate(
+    IP = IP * (1 / remaining_season_factor - 1),  # Adjust IP for remaining games
+    K_pct = K_pct * runif(n(), 0.98, 1.02),
+    BB_pct = BB_pct * runif(n(), 0.98, 1.02),
+    `ERA-` = `ERA-` * runif(n(), 0.98, 1.02),
+    `FIP-` = `FIP-` * runif(n(), 0.98, 1.02),
+    `WHIP+` = `WHIP+` * runif(n(), 0.98, 1.02),
+    BABIP = BABIP * runif(n(), 0.99, 1.01),
+    GB_pct = GB_pct * runif(n(), 0.99, 1.01),
+    FB_pct = FB_pct * runif(n(), 0.99, 1.01),
+    Age_Factor = sapply(Age, calculate_age_factor),
+    ERA_minus_inv = inverse_metric(`ERA-`),
+    FIP_minus_inv = inverse_metric(`FIP-`),
+    WHIP_plus_inv = inverse_metric(`WHIP+`),
+    is_starter = as.numeric(GS > (G - GS))
+  )
+```
+
+```{r}
+# Predict remaining WAR with age adjustment
+rest_of_season_predictions <- predict(rf_model, rest_of_season_2024 %>% select(all_of(model_features)))
+remaining_war_predictions <- mapply(calculate_remaining_war, 
+                                    rest_of_season_2024$WAR, 
+                                    rest_of_season_predictions, 
+                                    rest_of_season_2024$IP,
+                                    rest_of_season_2024$Age,
+                                    rest_of_season_2024$is_starter)
+```
+
+```{r}
+# Apply success factor and floor
+success_factor <- pmin(rest_of_season_2024$WAR / 2.5, 1)
+remaining_war_predictions <- remaining_war_predictions * (1 + success_factor)
+remaining_war_predictions <- pmax(remaining_war_predictions, -1.5)
+```
+
+```{r}
+# Apply age factor
+remaining_war_predictions <- remaining_war_predictions * rest_of_season_2024$Age_Factor
+
+# Add predictions to the dataset
+rest_of_season_2024$Predicted_Remaining_WAR <- remaining_war_predictions
+rest_of_season_2024$Predicted_Full_Season_WAR <- rest_of_season_2024$WAR + remaining_war_predictions
+
+# Print top 20 pitchers by predicted full season WAR
+print(rest_of_season_2024 %>% 
+        select(PlayerName, playerid, Age, WAR, Predicted_Remaining_WAR, Predicted_Full_Season_WAR, Age_Factor) %>% 
+        mutate(
+          WAR_Improvement = Predicted_Full_Season_WAR - WAR,
+          Improvement_Percentage = ifelse(WAR != 0, (Predicted_Full_Season_WAR - WAR) / abs(WAR) * 100, Inf)
+        ) %>%
+        arrange(desc(Predicted_Full_Season_WAR)) %>%
+        head(20))
+```
+
+```{r}
+# Print bottom 20 pitchers by predicted full season WAR
+print(rest_of_season_2024 %>% 
+        select(PlayerName, playerid, Age, WAR, Predicted_Remaining_WAR, Predicted_Full_Season_WAR, Age_Factor) %>% 
+        mutate(
+          WAR_Improvement = Predicted_Full_Season_WAR - WAR,
+          Improvement_Percentage = ifelse(WAR != 0, (Predicted_Full_Season_WAR - WAR) / abs(WAR) * 100, Inf)
+        ) %>%
+        arrange(Predicted_Full_Season_WAR) %>%
+        head(20))
+```
+
+```{r}
+# Print summary statistics for rest_of_season_2024
+print(paste("Max current WAR:", max(rest_of_season_2024$WAR)))
+print(paste("Min current WAR:", min(rest_of_season_2024$WAR)))
+print(paste("Max predicted remaining WAR:", max(rest_of_season_2024$Predicted_Remaining_WAR)))
+print(paste("Min predicted remaining WAR:", min(rest_of_season_2024$Predicted_Remaining_WAR)))
+print(paste("Max predicted full season WAR:", max(rest_of_season_2024$Predicted_Full_Season_WAR)))
+print(paste("Min predicted full season WAR:", min(rest_of_season_2024$Predicted_Full_Season_WAR)))
+print(paste("Number of players projected for negative WAR:", sum(rest_of_season_2024$Predicted_Full_Season_WAR < 0)))
+print(paste("Average predicted remaining WAR:", mean(rest_of_season_2024$Predicted_Remaining_WAR)))
+```
